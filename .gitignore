@@ -1,0 +1,14 @@
+# 忽略本地临时产物
+.trash/
+*.log
+debug.log
+
+# 编译器/IDE 中间文件
+obj/
+bin/
+.vs/
+*.user
+
+# 系统文件
+Thumbs.db
+desktop.ini
