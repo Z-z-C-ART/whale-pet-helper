@@ -28,6 +28,8 @@ namespace WhalePetHelper
         public const string Owner = "鲸鱼娘助手";
         public const string HideLabel = "隐藏桌宠";
         public const string PetId = "main";
+        public const int PortMin = 3080;
+        public const int PortMax = 3115;
         public static string ExePath { get { return Application.ExecutablePath; } }
     }
 
@@ -36,6 +38,13 @@ namespace WhalePetHelper
         public int Port;
         public int Pid;
         public string Token;
+    }
+
+    class PetInstance
+    {
+        public int Port;
+        public int Pid;
+        public int Uptime;
     }
 
     static class Json
@@ -98,18 +107,64 @@ namespace WhalePetHelper
             catch { return null; }
         }
 
-        public static bool Health(int port)
+        static Dictionary<string, object> HealthInfo(int port, int timeoutMs)
         {
             try
             {
-                using (var cts = new CancellationTokenSource(900))
+                using (var cts = new CancellationTokenSource(timeoutMs))
                 {
-                    var t = Http.GetAsync("http://127.0.0.1:" + port + "/health", cts.Token);
+                    var t = GetText("http://127.0.0.1:" + port + "/health", cts.Token);
                     t.Wait();
-                    return t.Result.IsSuccessStatusCode;
+                    return Json.Parse(t.Result);
                 }
             }
-            catch { return false; }
+            catch { return null; }
+        }
+
+        static bool IsStandaloneInfo(Dictionary<string, object> dict)
+        {
+            return dict != null && Json.Str(dict, "name") == "dsh-pet-standalone";
+        }
+
+        public static bool Health(int port)
+        {
+            if (port <= 0) return false;
+            return IsStandaloneInfo(HealthInfo(port, 800));
+        }
+
+        static readonly object InstanceGate = new object();
+        static List<PetInstance> instanceCache = new List<PetInstance>();
+        static DateTime instanceCacheAt = DateTime.MinValue;
+        static bool starting;
+
+        public static List<PetInstance> FindInstances(bool force)
+        {
+            lock (InstanceGate)
+            {
+                if (!force && (DateTime.Now - instanceCacheAt).TotalSeconds < 4) return new List<PetInstance>(instanceCache);
+                var found = new List<PetInstance>();
+                var tasks = new List<Task<PetInstance>>();
+                for (int p = Cfg.PortMin; p <= Cfg.PortMax; p++)
+                {
+                    int port = p;
+                    tasks.Add(Task.Run(delegate
+                    {
+                        var info = HealthInfo(port, 500);
+                        if (!IsStandaloneInfo(info)) return null;
+                        var inst = new PetInstance();
+                        inst.Port = port;
+                        try { inst.Pid = Convert.ToInt32(Json.Get(info, "pid")); } catch { inst.Pid = 0; }
+                        try { inst.Uptime = Convert.ToInt32(Json.Get(info, "uptimeSec")); } catch { inst.Uptime = 0; }
+                        return inst;
+                    }));
+                }
+                try { Task.WaitAll(tasks.ToArray(), 6000); } catch { }
+                foreach (var t in tasks) if (t.Status == TaskStatus.RanToCompletion && t.Result != null) found.Add(t.Result);
+                found.Sort(delegate(PetInstance a, PetInstance b) { return a.Port.CompareTo(b.Port); });
+                instanceCache = found;
+                instanceCacheAt = DateTime.Now;
+                return new List<PetInstance>(found);
+            }
         }
 
         public static bool StandaloneAlive(out PetRuntime rt)
@@ -118,40 +173,133 @@ namespace WhalePetHelper
             return rt != null && Health(rt.Port);
         }
 
-        public static string StartStandalone()
+        static bool IsPidAlive(int pid) { try { var p = Process.GetProcessById(pid); return !p.HasExited; } catch { return false; } }
+
+        static void KillByPid(int pid)
         {
-            if (!File.Exists(Cfg.PetCmd)) return "找不到 dsh-pet-standalone.cmd，请先 npm install -g dsh-pet";
-            PetRuntime rt;
-            if (StandaloneAlive(out rt)) return "独立桌宠已经在运行（端口 " + rt.Port + "）";
+            try { var p = Process.GetProcessById(pid); if (!p.HasExited) p.Kill(); } catch { }
+        }
+
+        public static int StopAllInstances()
+        {
+            var rt = ReadRuntime();
+            var before = FindInstances(true);
+            int stopped = before.Count;
+            if (rt != null)
+            {
+                bool tracked = false;
+                foreach (var inst in before) if (inst.Port == rt.Port) tracked = true;
+                if (tracked)
+                {
+                    try
+                    {
+                        var req = new HttpRequestMessage(HttpMethod.Post, "http://127.0.0.1:" + rt.Port + "/shutdown");
+                        req.Headers.Add("x-dsh-pet-token", rt.Token ?? "");
+                        Http.SendAsync(req).Wait();
+                    }
+                    catch { }
+                }
+            }
+            Thread.Sleep(1200);
+            foreach (var inst in FindInstances(true)) KillByPid(inst.Pid);
+            Thread.Sleep(600);
+            var after = ReadRuntime();
+            if (after != null && !IsPidAlive(after.Pid))
+            {
+                try { File.Delete(Cfg.RuntimePath); } catch { }
+            }
+            instanceCacheAt = DateTime.MinValue;
+            return stopped;
+        }
+
+        static string SpawnStandalone()
+        {
             var psi = new ProcessStartInfo("cmd.exe", "/c \"" + Cfg.PetCmd + "\"");
             psi.UseShellExecute = false;
             psi.CreateNoWindow = true;
             psi.WindowStyle = ProcessWindowStyle.Hidden;
             Process.Start(psi);
-            var sw = Stopwatch.StartNew();
-            while (sw.ElapsedMilliseconds < 25000)
+            return null;
+        }
+
+        public static string StartStandalone()
+        {
+            if (starting) return "正在启动中，请稍候…";
+            starting = true;
+            try
             {
-                Thread.Sleep(400);
-                if (StandaloneAlive(out rt)) return "已启动（端口 " + rt.Port + "）";
+                if (!File.Exists(Cfg.PetCmd)) return "找不到 dsh-pet-standalone.cmd，请先 npm install -g dsh-pet";
+                var list = FindInstances(true);
+                if (list.Count == 1)
+                {
+                    var rt = ReadRuntime();
+                    if (rt != null && rt.Port == list[0].Port && !string.IsNullOrEmpty(rt.Token))
+                    {
+                        bool shown = EnsureVisible(list[0].Port, rt.Token);
+                        return "独立桌宠已经在运行（端口 " + list[0].Port + (shown ? "，已确保显示" : "，但显示失败") + "）";
+                    }
+                    return RestartSingle(list[0]);
+                }
+                if (list.Count > 1)
+                {
+                    StopAllInstances();
+                    Thread.Sleep(900);
+                }
+
+                SpawnStandalone();
+                var sw = Stopwatch.StartNew();
+                while (sw.ElapsedMilliseconds < 45000)
+                {
+                    Thread.Sleep(600);
+                    var found = FindInstances(true);
+                    if (found.Count == 1)
+                    {
+                        var rt = ReadRuntime();
+                        if (rt != null && rt.Port == found[0].Port)
+                        {
+                            EnsureVisible(found[0].Port, rt.Token);
+                            return "已启动（端口 " + found[0].Port + "）";
+                        }
+                        return "已启动（端口 " + found[0].Port + "，运行时记录稍后生成）";
+                    }
+                    if (found.Count > 1)
+                    {
+                        StopAllInstances();
+                        return "启动异常：出现了多个实例，已自动清理，请重试一次";
+                    }
+                }
+                return "启动失败：45 秒内没检测到桌宠进程，请检查 dsh-pet 全局安装是否正常";
             }
-            return "已发起启动，但 25 秒内没等到端口就绪；请查看托盘或日志";
+            finally { starting = false; }
+        }
+
+        static string RestartSingle(PetInstance inst)
+        {
+            KillByPid(inst.Pid);
+            Thread.Sleep(1200);
+            try { File.Delete(Cfg.RuntimePath); } catch { }
+            SpawnStandalone();
+            var sw = Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < 45000)
+            {
+                Thread.Sleep(600);
+                var rt = ReadRuntime();
+                if (rt != null && Health(rt.Port))
+                {
+                    EnsureVisible(rt.Port, rt.Token);
+                    return "已重启并恢复运行时记录（端口 " + rt.Port + "）";
+                }
+            }
+            return "已尝试重建运行时记录，但 45 秒内未就绪";
         }
 
         public static string StopStandalone()
         {
-            PetRuntime rt;
-            if (!StandaloneAlive(out rt)) return "独立桌宠本来就没在运行";
-            try
-            {
-                var req = new HttpRequestMessage(HttpMethod.Post, "http://127.0.0.1:" + rt.Port + "/shutdown");
-                req.Headers.Add("x-dsh-pet-token", rt.Token ?? "");
-                Http.SendAsync(req).Wait();
-                Thread.Sleep(600);
-                return "已请求退出（端口 " + rt.Port + "）";
-            }
-            catch (Exception ex) { return "停止失败：" + ex.Message; }
+            var list = FindInstances(true);
+            if (list.Count == 0) return "独立桌宠本来就没在运行";
+            StopAllInstances();
+            return "已停止独立桌宠（" + list.Count + " 个实例）";
         }
-
         public static string SetDisplay(int port, string display, string token, out bool ok)
         {
             ok = false;
@@ -169,6 +317,26 @@ namespace WhalePetHelper
             catch (Exception ex) { return ex.Message; }
         }
 
+        public static bool EnsureVisible(int port, string token)
+        {
+            bool ok;
+            SetDisplay(port, "desktop", token, out ok);
+            return ok;
+        }
+
+        public static string GetDisplay(int port)
+        {
+            try
+            {
+                var t = GetText("http://127.0.0.1:" + port + "/dsh-pet-7340/config", CancellationToken.None);
+                t.Wait();
+                var dict = Json.Parse(t.Result);
+                var pets = Json.Get(dict, "pets") as IList;
+                if (pets != null && pets.Count > 0) return Json.Str(pets[0], "display");
+            }
+            catch { }
+            return null;
+        }
         public static Dictionary<string, object> State(int port)
         {
             try
@@ -354,8 +522,8 @@ namespace WhalePetHelper
         public MainForm(bool startHidden)
         {
             Text = "鲸鱼娘桌宠助手";
-            ClientSize = new Size(560, 470);
-            MinimumSize = new Size(560, 470);
+            ClientSize = new Size(660, 470);
+            MinimumSize = new Size(660, 470);
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Microsoft YaHei UI", 9.5f);
             BackColor = Color.FromArgb(248, 249, 252);
@@ -370,7 +538,7 @@ namespace WhalePetHelper
 
             var card = new Panel();
             card.Location = new Point(20, 56);
-            card.Size = new Size(520, 150);
+            card.Size = new Size(620, 150);
             card.BackColor = Color.White;
             card.BorderStyle = BorderStyle.FixedSingle;
             Controls.Add(card);
@@ -381,11 +549,15 @@ namespace WhalePetHelper
             card.Controls.Add(lblStd); card.Controls.Add(lblDsh); card.Controls.Add(lblPet);
 
             int y = 224;
-            AddButton("启动桌宠", 20, y, 96, delegate { RunAsync(delegate { return Pet.StartStandalone(); }); });
-            AddButton("停止桌宠", 124, y, 96, delegate { RunAsync(delegate { return Pet.StopStandalone(); }); });
+            var startBtn = AddButton("启动桌宠", 20, y, 96, null);
+            startBtn.Click += delegate { RunBusy(startBtn, delegate { return Pet.StartStandalone(); }); };
+            var stopBtn = AddButton("停止桌宠", 124, y, 96, null);
+            stopBtn.Click += delegate { RunBusy(stopBtn, delegate { return Pet.StopStandalone(); }); };
             AddButton("隐藏桌宠", 228, y, 96, delegate { HideAll(); });
             AddButton("显示桌宠", 332, y, 96, delegate { ShowAll(); });
-            AddButton("刷新状态", 436, y, 104, delegate { RefreshStatus(); });
+            AddButton("刷新状态", 436, y, 96, delegate { RefreshStatus(); });
+            var cleanBtn = AddButton("清理重复", 540, y, 100, null);
+            cleanBtn.Click += delegate { RunBusy(cleanBtn, delegate { return CleanDuplicatesNow(); }); };
 
             y += 44;
             AddButton("打开 DSH", 20, y, 96, delegate { OpenDsh(); });
@@ -414,7 +586,7 @@ namespace WhalePetHelper
             Controls.Add(lblAuto);
 
             log.Location = new Point(20, y + 26);
-            log.Size = new Size(520, 110);
+            log.Size = new Size(620, 110);
             log.Multiline = true;
             log.ReadOnly = true;
             log.ScrollBars = ScrollBars.Vertical;
@@ -426,7 +598,7 @@ namespace WhalePetHelper
             var tip = new Label();
             tip.Text = "右键桌宠 →「更多」→ 鲸鱼娘助手 → 隐藏桌宠；隐藏后从这里或托盘「显示桌宠」恢复。";
             tip.AutoSize = false;
-            tip.Size = new Size(520, 34);
+            tip.Size = new Size(620, 34);
             tip.ForeColor = Color.FromArgb(120, 126, 140);
             tip.Location = new Point(20, y + 142);
             Controls.Add(tip);
@@ -484,15 +656,37 @@ namespace WhalePetHelper
             l.Text = "…";
         }
 
-        void AddButton(string text, int x, int y, int w, EventHandler onClick)
+        Button AddButton(string text, int x, int y, int w, EventHandler onClick)
         {
             var b = new Button();
             b.Text = text;
             b.Location = new Point(x, y);
             b.Size = new Size(w, 34);
             b.FlatStyle = FlatStyle.System;
-            b.Click += onClick;
+            if (onClick != null) b.Click += onClick;
             Controls.Add(b);
+            return b;
+        }
+
+        void RunBusy(Button btn, Func<string> work)
+        {
+            btn.Enabled = false;
+            Task.Run(delegate
+            {
+                string msg;
+                try { msg = work(); }
+                catch (Exception ex) { msg = "操作失败：" + ex.Message; }
+                try
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        btn.Enabled = true;
+                        AppendLog(msg);
+                        RefreshStatus();
+                    }));
+                }
+                catch { }
+            });
         }
 
         Icon LoadIcon()
@@ -565,36 +759,40 @@ namespace WhalePetHelper
             });
         }
 
-        void HideAll()
+        void ApplyDisplayToAll(string display, string verb)
         {
             RunAsync(delegate
             {
-                PetRuntime rt;
-                int std = Pet.StandaloneAlive(out rt) ? rt.Port : 0;
+                var list = Pet.FindInstances(true);
+                var rt = Pet.ReadRuntime();
                 int dsh = CurrentDshPort();
                 var parts = new List<string>();
-                if (std > 0) { bool ok; var err = Pet.SetDisplay(std, "none", rt.Token, out ok); parts.Add(ok ? "独立桌宠已隐藏" : "独立桌宠隐藏失败：" + err); }
-                if (dsh > 0) { bool ok; var err = Pet.SetDisplay(dsh, "none", null, out ok); parts.Add(ok ? "DSH 桌宠已隐藏" : "DSH 桌宠隐藏失败：" + err); }
-                if (parts.Count == 0) parts.Add("没有找到正在运行的桌宠");
+                if (list.Count == 0 && dsh <= 0) return "没有找到正在运行的桌宠";
+                foreach (var inst in list)
+                {
+                    string token = (rt != null && rt.Port == inst.Port) ? rt.Token : null;
+                    bool ok; var err = Pet.SetDisplay(inst.Port, display, token, out ok);
+                    parts.Add(ok ? ("独立桌宠（" + inst.Port + "）已" + verb) : ("独立桌宠（" + inst.Port + "）" + verb + "失败：" + err));
+                }
+                if (dsh > 0)
+                {
+                    bool ok; var err = Pet.SetDisplay(dsh, display, null, out ok);
+                    parts.Add(ok ? ("DSH 桌宠已" + verb) : ("DSH 桌宠" + verb + "失败：" + err));
+                }
+                if (list.Count > 1) parts.Add("检测到 " + list.Count + " 个独立实例，建议点「清理重复」");
                 return string.Join("；", parts.ToArray());
             });
         }
 
-        void ShowAll()
-        {
-            RunAsync(delegate
-            {
-                PetRuntime rt;
-                int std = Pet.StandaloneAlive(out rt) ? rt.Port : 0;
-                int dsh = CurrentDshPort();
-                var parts = new List<string>();
-                if (std > 0) { bool ok; var err = Pet.SetDisplay(std, "desktop", rt.Token, out ok); parts.Add(ok ? "独立桌宠已显示" : "独立桌宠显示失败：" + err); }
-                if (dsh > 0) { bool ok; var err = Pet.SetDisplay(dsh, "desktop", null, out ok); parts.Add(ok ? "DSH 桌宠已显示" : "DSH 桌宠显示失败：" + err); }
-                if (parts.Count == 0) parts.Add("没有找到正在运行的桌宠，先点「启动桌宠」");
-                return string.Join("；", parts.ToArray());
-            });
-        }
+        void HideAll() { ApplyDisplayToAll("none", "隐藏"); }
 
+        void ShowAll() { ApplyDisplayToAll("desktop", "显示"); }
+
+        string CleanDuplicatesNow()
+        {
+            int n = Pet.StopAllInstances();
+            return n > 0 ? ("已清理 " + n + " 个独立桌宠实例") : "没有检测到独立桌宠实例";
+        }
         int CurrentDshPort()
         {
             if (cachedDshPort > 0 && (DateTime.Now - dshFoundAt).TotalSeconds < 30) return cachedDshPort;
@@ -639,9 +837,8 @@ namespace WhalePetHelper
         {
             Task.Run(delegate
             {
-                PetRuntime rt;
-                bool stdAlive = Pet.StandaloneAlive(out rt);
-                int stdPort = stdAlive ? rt.Port : 0;
+                var instances = Pet.FindInstances(false);
+                int stdPort = instances.Count > 0 ? instances[0].Port : 0;
                 int dsh;
                 if (cachedDshPort > 0 && (DateTime.Now - dshFoundAt).TotalSeconds < 30) dsh = cachedDshPort;
                 else { dsh = Pet.DiscoverDsh(stdPort); cachedDshPort = dsh; dshFoundAt = DateTime.Now; }
@@ -657,14 +854,41 @@ namespace WhalePetHelper
                     petInfo = "任务状态：" + (work ?? "—") + (money != null ? "　余额：¥" + money : "");
                 }
 
+                string stdText;
+                Color stdColor;
+                if (instances.Count == 0)
+                {
+                    stdText = "独立桌宠：○ 未运行";
+                    stdColor = Color.FromArgb(130, 136, 150);
+                }
+                else if (instances.Count == 1)
+                {
+                    string disp = Pet.GetDisplay(instances[0].Port);
+                    if (disp == "none")
+                    {
+                        stdText = "独立桌宠：● 运行中（已隐藏）　端口 " + instances[0].Port;
+                        stdColor = Color.FromArgb(200, 110, 20);
+                    }
+                    else
+                    {
+                        stdText = "独立桌宠：● 运行中　端口 " + instances[0].Port + "　PID " + instances[0].Pid;
+                        stdColor = Color.FromArgb(28, 140, 90);
+                    }
+                }
+                else
+                {
+                    var ports = new List<string>();
+                    foreach (var i in instances) ports.Add(i.Port.ToString());
+                    stdText = "独立桌宠：● 运行中 ×" + instances.Count + "（端口 " + string.Join(",", ports.ToArray()) + "）⚠ 重复";
+                    stdColor = Color.FromArgb(200, 110, 20);
+                }
+
                 try
                 {
                     BeginInvoke(new Action(delegate
                     {
-                        lblStd.Text = stdAlive
-                            ? "独立桌宠：● 运行中　端口 " + stdPort + "　PID " + (rt != null ? rt.Pid : 0)
-                            : "独立桌宠：○ 未运行";
-                        lblStd.ForeColor = stdAlive ? Color.FromArgb(28, 140, 90) : Color.FromArgb(130, 136, 150);
+                        lblStd.Text = stdText;
+                        lblStd.ForeColor = stdColor;
                         lblDsh.Text = dsh > 0 ? "DSH：● 已连接　端口 " + dsh : "DSH：○ 未运行（或未装桌宠插件）";
                         lblDsh.ForeColor = dsh > 0 ? Color.FromArgb(28, 140, 90) : Color.FromArgb(130, 136, 150);
                         lblPet.Text = petInfo;
@@ -676,7 +900,6 @@ namespace WhalePetHelper
             });
         }
     }
-
     static class Program
     {
         static Mutex mutex;
