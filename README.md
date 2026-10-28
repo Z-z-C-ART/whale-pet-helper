@@ -1,4 +1,4 @@
-# 鲸鱼娘桌宠助手
+> **完整项目（独立桌宠 + DSH 联动 + 助手）已整理到 [whale-pet-suite](https://github.com/Z-z-C-ART/whale-pet-suite)。**`n> 本仓库只保留助手这一个模块。`n`n# 鲸鱼娘桌宠助手
 
 一个约 30 KB 的本地小工具（C# / .NET Framework WinForms，双击即用，不需要装运行时），把之前那 5 个 PowerShell/VBS 脚本的功能收进一个窗口，并给桌宠右键菜单加了「隐藏」。
 
