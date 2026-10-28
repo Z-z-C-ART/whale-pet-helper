@@ -332,10 +332,22 @@ namespace WhalePetHelper
                 t.Wait();
                 var dict = Json.Parse(t.Result);
                 var pets = Json.Get(dict, "pets") as IList;
+                if (pets == null)
+                {
+                    var main = Json.Get(dict, "main") as Dictionary<string, object>;
+                    if (main != null) pets = Json.Get(main, "pets") as IList;
+                }
                 if (pets != null && pets.Count > 0) return Json.Str(pets[0], "display");
             }
             catch { }
             return null;
+        }
+        public static bool RestoreIfHidden(int port, string token)
+        {
+            if (GetDisplay(port) != "none") return false;
+            bool ok;
+            SetDisplay(port, "desktop", token, out ok);
+            return ok;
         }
         public static Dictionary<string, object> State(int port)
         {
@@ -421,8 +433,10 @@ namespace WhalePetHelper
     class MenuWatcher
     {
         readonly Action onHide;
+        readonly Action onRestored;
         volatile bool stopping;
-        public MenuWatcher(Action onHide) { this.onHide = onHide; }
+        public MenuWatcher(Action onHide) : this(onHide, null) { }
+        public MenuWatcher(Action onHide, Action onRestored) { this.onHide = onHide; this.onRestored = onRestored; }
 
         public void Stop() { stopping = true; }
 
@@ -436,6 +450,7 @@ namespace WhalePetHelper
         void Loop()
         {
             int dshPort = 0;
+            int lastDshPort = 0;
             DateTime dshAt = DateTime.MinValue;
             while (!stopping)
             {
@@ -446,6 +461,14 @@ namespace WhalePetHelper
                     dshPort = Pet.DiscoverDsh(stdPort);
                     dshAt = DateTime.Now;
                 }
+
+                if (dshPort > 0 && dshPort != lastDshPort)
+                {
+                    // 新发现一个 DSH 宿主（DSH 重启会换端口，或助手刚启动）：把上次的「隐藏」自动恢复
+                    if (Pet.RestoreIfHidden(dshPort, null) && onRestored != null) onRestored();
+                    lastDshPort = dshPort;
+                }
+                else if (dshPort == 0) lastDshPort = 0;
 
                 bool polled = false;
                 if (stdPort > 0) { PollOnce(stdPort, rt.Token); polled = true; }
@@ -603,7 +626,11 @@ namespace WhalePetHelper
             tip.Location = new Point(20, y + 142);
             Controls.Add(tip);
 
-            watcher = new MenuWatcher(HideAll);
+            watcher = new MenuWatcher(HideAll, delegate
+            {
+                AppendLog("检测到 DSH 启动或助手重启：已自动恢复桌宠显示");
+                RefreshStatus();
+            });
             watcher.Start();
 
             tray = new NotifyIcon();
@@ -732,7 +759,15 @@ namespace WhalePetHelper
             watcher.Stop();
             try
             {
-                PetRuntime rt;
+                // 退出前把「隐藏」恢复成可见，避免下次开 DSH 时因为 display=none 不出现
+                var list = Pet.FindInstances(false);
+                var rt = Pet.ReadRuntime();
+                foreach (var inst in list)
+                {
+                    string token = (rt != null && rt.Port == inst.Port) ? rt.Token : null;
+                    Pet.RestoreIfHidden(inst.Port, token);
+                }
+                if (cachedDshPort > 0) Pet.RestoreIfHidden(cachedDshPort, null);
                 if (Pet.StandaloneAlive(out rt)) Pet.UnregisterMenu(rt.Port, rt.Token);
                 if (cachedDshPort > 0) Pet.UnregisterMenu(cachedDshPort, null);
             }
